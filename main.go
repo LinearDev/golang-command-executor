@@ -7,11 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 var pwd string
 var stdin, stdout, stderr bytes.Buffer
 var stdoutoldlen int = 0
+var commandExited bool = false
 
 type NodeType int
 
@@ -29,8 +31,12 @@ type Node struct {
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
-	pwd, _ = os.UserHomeDir()
-	os.Chdir(pwd)
+	// pwd, _ = os.UserHomeDir()
+	pwd = "/Users/amadeus/Desktop/git/golang-command-executor"
+	os.Chdir("/Users/amadeus/Desktop/git/golang-command-executor")
+
+	stdout = bytes.Buffer{}
+	stderr = bytes.Buffer{}
 
 	go func() {
 		for {
@@ -193,9 +199,21 @@ func unixCommandExecutor(input, command string) ([]byte, error) {
 	cmd = exec.Command(commWithArgs[0], commWithArgs[1:]...)
 	cmd.Dir = pwd
 	cmd.Stderr = &stderr
-	cmd.Stdin = &stdin
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = &stdout
 
+	go func() {
+		for {
+			proc := cmd.Process
+			if proc != nil && !commandExited {
+				//indicates if command expects input
+				// fmt.Println(proc)
+			}
+			time.Sleep(time.Second)
+		}
+	}()
+
+	fmt.Println("tes")
 	err := cmd.Run()
 	if err == nil {
 		return stdout.Bytes(), nil
