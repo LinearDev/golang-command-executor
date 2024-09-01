@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"helpers"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -31,16 +33,19 @@ type Node struct {
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
-	// pwd, _ = os.UserHomeDir()
-	pwd = "/Users/amadeus/Desktop/git/golang-command-executor"
-	os.Chdir("/Users/amadeus/Desktop/git/golang-command-executor")
+	pwd, _ = os.UserHomeDir()
+	os.Chdir(pwd)
 
 	stdout = bytes.Buffer{}
 	stderr = bytes.Buffer{}
 
 	go func() {
 		for {
-			out := stdout.String()
+			out, err := helpers.UTF16BytesToString(stdout.Bytes())
+			if err != nil {
+				fmt.Println("errored to parse stdout to UTF16 string", err)
+			}
+			out = helpers.EscapeANSICodes(out)
 
 			if len(out)-stdoutoldlen > 0 {
 				transformed := out[stdoutoldlen:]
@@ -196,7 +201,11 @@ func unixCommandExecutor(input, command string) ([]byte, error) {
 
 	var cmd *exec.Cmd
 	commWithArgs := strings.Fields(command)
-	cmd = exec.Command(commWithArgs[0], commWithArgs[1:]...)
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("powershell", "-Command", strings.Join(commWithArgs, " "))
+	} else {
+		cmd = exec.Command(commWithArgs[0], commWithArgs[1:]...)
+	}
 	cmd.Dir = pwd
 	cmd.Stderr = &stderr
 	cmd.Stdin = os.Stdin
@@ -213,7 +222,6 @@ func unixCommandExecutor(input, command string) ([]byte, error) {
 		}
 	}()
 
-	fmt.Println("tes")
 	err := cmd.Run()
 	if err == nil {
 		return stdout.Bytes(), nil
