@@ -1,21 +1,22 @@
-package main
+package golangcommandexecutor
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
-	"helpers"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	"helpers"
 )
 
 var pwd string
 var stdin, stdout, stderr bytes.Buffer
 var stdoutoldlen int = 0
 var commandExited bool = false
+var commandAwaiting bool = false
 
 type NodeType int
 
@@ -31,9 +32,40 @@ type Node struct {
 	Right *Node
 }
 
-func main() {
-	reader := bufio.NewReader(os.Stdin)
-	pwd, _ = os.UserHomeDir()
+type OutputTypes uint8
+
+const (
+	PWDChange       OutputTypes = 0
+	Out             OutputTypes = 1
+	WaitingForInput OutputTypes = 2
+	Errored         OutputTypes = 3
+	Exit            OutputTypes = 4
+)
+
+type Output struct {
+	Type OutputTypes
+	Data string
+}
+
+type APITerm struct {
+	Command      string
+	PWD          string
+	PWDChan      chan string //pwd changes handler
+	OutputChan   chan Output //channel for getting updates from `sdtout`
+	StdInputChan chan string //if command requires output
+}
+
+func (api *APITerm) InitExecution() {
+	pwd := api.PWD
+	if len(api.PWD) == 0 {
+		pwd, _ = os.UserHomeDir()
+
+		//give new pwd string
+		api.OutputChan <- Output{
+			Type: PWDChange,
+			Data: pwd,
+		}
+	}
 	os.Chdir(pwd)
 
 	stdout = bytes.Buffer{}
@@ -48,66 +80,69 @@ func main() {
 			out = helpers.EscapeANSICodes(out)
 
 			if len(out)-stdoutoldlen > 0 {
-				transformed := out[stdoutoldlen:]
+				transformed := strings.TrimSpace(out[stdoutoldlen:])
 				stdoutoldlen = len(out)
-				fmt.Print(transformed)
+				if commandAwaiting && len(transformed) != 0 {
+					api.OutputChan <- Output{
+						Type: Out,
+						Data: transformed,
+					}
+				}
 			}
 		}
+
 	}()
 
-	for {
-		fmt.Print("> ")
+	input := strings.TrimSpace(api.Command)
 
-		// Считываем строку, введенную пользователем
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading input:", err)
-			continue
+	//build execution tree from input string
+	tree := parseCommand(input)
+
+	// run command node tree execution
+	out, err := executeCommand(api, nil, tree)
+	api.OutputChan <- Output{
+		Type: Out,
+		Data: helpers.EscapeANSICodes(string(out))[stdoutoldlen:],
+	}
+	//if execution is errored and command not returned error
+	if err != nil && out == nil {
+		//return error throw chanel
+		api.OutputChan <- Output{
+			Type: Errored,
+			Data: err.Error(),
 		}
+	}
 
-		// Удаляем лишние пробелы и символы новой строки
-		input = strings.TrimSpace(input)
-
-		// Если введена команда "exit", выходим из программы
-		if input == "exit" {
-			fmt.Println("Exiting...")
-			break
-		}
-
-		tree := parseUnixCommand(input)
-
-		// Обработка команды
-		out, err := executeUnixCommand(nil, tree)
-		if err != nil {
-			if out == nil {
-				fmt.Println(err)
-			}
-		}
+	api.OutputChan <- Output{
+		Type: Exit,
+		Data: "",
 	}
 }
 
-func parseUnixCommand(input string) *Node {
+// parses string and builds Command Node Tree
+func parseCommand(input string) *Node {
 	input = strings.TrimSpace(input)
 
 	if strings.HasPrefix(input, "(") && strings.HasSuffix(input, ")") {
-		// Удаляем скобки и рекурсивно парсим содержимое
-		return parseUnixCommand(input[1 : len(input)-1])
+		// remove the brackets and recursively parse the contents
+		return parseCommand(input[1 : len(input)-1])
 	}
 
+	// supported command operators
 	operators := []string{"||", "&&", "|", ">", "<"}
 	for _, op := range operators {
 		if idx := findOperatorOutsideBrackets(input, op); idx != -1 {
-			// Создаем узел с оператором
+			// build node with operator
 			return &Node{
 				Type:  Operator,
 				Value: op,
-				Left:  parseUnixCommand(input[:idx]),
-				Right: parseUnixCommand(input[idx+len(op):]),
+				Left:  parseCommand(input[:idx]),
+				Right: parseCommand(input[idx+len(op):]),
 			}
 		}
 	}
 
-	// Если операторов нет, считаем, что это команда
+	// If there are no operators, we consider it a terminal command
 	return &Node{
 		Type:  Command,
 		Value: input,
@@ -128,27 +163,30 @@ func findOperatorOutsideBrackets(input, operator string) int {
 	return -1
 }
 
-// Функция для выполнения команды с поддержкой операторов
-func executeUnixCommand(input []byte, node *Node) ([]byte, error) {
+// function for command execution that supports operators
+func executeCommand(api *APITerm, input []byte, node *Node) ([]byte, error) {
 	switch node.Value {
+	// if previous command execution result is true run next command
 	case "&&":
-		_, err := executeUnixCommand(nil, node.Left)
+		_, err := executeCommand(api, nil, node.Left)
 		if err != nil {
 			return nil, err
 		}
 
-		return executeUnixCommand(nil, node.Right)
+		return executeCommand(api, nil, node.Right)
+	// if previous command execution result is false run next command
 	case "||":
-		_, err := executeUnixCommand(nil, node.Left)
+		_, err := executeCommand(api, nil, node.Left)
 		if err == nil {
 			return nil, err
 		}
 
-		return executeUnixCommand(nil, node.Right)
+		return executeCommand(api, nil, node.Right)
+	// pipe from file output
 	case ">":
 		// Handle output redirection
 		if node.Right != nil && node.Right.Type == Command {
-			output, err := executeUnixCommand(nil, node.Left)
+			output, err := executeCommand(api, nil, node.Left)
 			if err != nil {
 				return nil, err
 			}
@@ -160,6 +198,7 @@ func executeUnixCommand(input []byte, node *Node) ([]byte, error) {
 			}
 		}
 		return nil, nil
+	// pipe from file input
 	case "<":
 		// Handle input redirection
 		if node.Right != nil && node.Right.Type == Command {
@@ -169,29 +208,34 @@ func executeUnixCommand(input []byte, node *Node) ([]byte, error) {
 				return nil, err
 			}
 
-			return executeUnixCommand(fileContent, node.Left)
+			return executeCommand(api, fileContent, node.Left)
 		}
+	//pipe from command to command
+	//example `cat test | grep example.com`
 	case "|":
-		leftOutput, err := executeUnixCommand(nil, node.Left)
+		leftOutput, err := executeCommand(api, nil, node.Left)
 		if err != nil {
 			return nil, err
 		}
 
-		return executeUnixCommand(leftOutput, node.Right)
+		return executeCommand(api, leftOutput, node.Right)
+	//as default run command
 	default:
-		return unixCommandExecutor(string(input), node.Value)
+		return commandExecutor(api, string(input), node.Value)
 	}
 
 	return nil, nil
 }
 
-func unixCommandExecutor(input, command string) ([]byte, error) {
-	executed := unixMiddleware(command)
-
+func commandExecutor(api *APITerm, input, command string) ([]byte, error) {
+	//first run command throw middleware
+	executed := middleware(command)
+	//if middleware handle command as cd return output
 	if executed {
 		return nil, nil
 	}
 
+	//check if we need to pass input from prev command output
 	if len(input) != 0 {
 		_, err := stdin.WriteString(input)
 		if err != nil {
@@ -200,37 +244,59 @@ func unixCommandExecutor(input, command string) ([]byte, error) {
 	}
 
 	var cmd *exec.Cmd
+	done := make(chan bool)
+
+	//create command from string -> [command, ...args]
 	commWithArgs := strings.Fields(command)
+
+	//create Cmd struct according to OS
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("powershell", "-Command", strings.Join(commWithArgs, " "))
 	} else {
 		cmd = exec.Command(commWithArgs[0], commWithArgs[1:]...)
 	}
+
 	cmd.Dir = pwd
+	cmd.Stdin = bytes.NewReader([]byte(input))
 	cmd.Stderr = &stderr
-	cmd.Stdin = os.Stdin
 	cmd.Stdout = &stdout
 
+	// Handle input piping
+	// if len(input) != 0 {
+	// } else {
+	// 	cmd.Stdin = os.Stdin
+	// }
+
+	//indicates if command expects input
 	go func() {
 		for {
+			time.Sleep(500 * time.Millisecond)
 			proc := cmd.Process
 			if proc != nil && !commandExited {
-				//indicates if command expects input
-				// fmt.Println(proc)
+				commandAwaiting = true
+				api.OutputChan <- Output{
+					Type: WaitingForInput,
+					Data: "",
+				}
 			}
-			time.Sleep(time.Second)
+
+			if <-done {
+				break
+			}
 		}
 	}()
 
+	//run command with waiting for result
 	err := cmd.Run()
-	if err == nil {
-		return stdout.Bytes(), nil
+	done <- true
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, err
+	return stdout.Bytes(), nil
 }
 
-func unixMiddleware(command string) bool {
+func middleware(command string) bool {
 	commandWithArgs := strings.Fields(command)
 
 	switch commandWithArgs[0] {
