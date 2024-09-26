@@ -3,20 +3,20 @@ package golangcommandexecutor
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"helpers"
 )
 
+var sharedAPI *APITerm
 var pwd string
-var stdin, stdout, stderr bytes.Buffer
-var stdoutoldlen int = 0
-var commandExited bool = false
-var commandAwaiting bool = false
 
 type NodeType int
 
@@ -43,55 +43,35 @@ const (
 )
 
 type Output struct {
-	Type OutputTypes
-	Data string
+	Type    OutputTypes
+	Data    string
+	Payload string
 }
 
 type APITerm struct {
 	Command      string
 	PWD          string
-	PWDChan      chan string //pwd changes handler
 	OutputChan   chan Output //channel for getting updates from `sdtout`
 	StdInputChan chan string //if command requires output
+	CmdInterrupt chan os.Signal
 }
 
 func (api *APITerm) InitExecution() {
+	sharedAPI = api
 	pwd := api.PWD
 	if len(api.PWD) == 0 {
 		pwd, _ = os.UserHomeDir()
-
-		//give new pwd string
-		api.OutputChan <- Output{
-			Type: PWDChange,
-			Data: pwd,
-		}
 	}
 	os.Chdir(pwd)
+	//give new pwd string
+	api.OutputChan <- Output{
+		Type:    PWDChange,
+		Data:    pwd,
+		Payload: pwd,
+	}
 
-	stdout = bytes.Buffer{}
-	stderr = bytes.Buffer{}
-
-	go func() {
-		for {
-			out, err := helpers.UTF16BytesToString(stdout.Bytes())
-			if err != nil {
-				fmt.Println("errored to parse stdout to UTF16 string", err)
-			}
-			out = helpers.EscapeANSICodes(out)
-
-			if len(out)-stdoutoldlen > 0 {
-				transformed := strings.TrimSpace(out[stdoutoldlen:])
-				stdoutoldlen = len(out)
-				if commandAwaiting && len(transformed) != 0 {
-					api.OutputChan <- Output{
-						Type: Out,
-						Data: transformed,
-					}
-				}
-			}
-		}
-
-	}()
+	done := make(chan bool)
+	defer close(done)
 
 	input := strings.TrimSpace(api.Command)
 
@@ -100,10 +80,7 @@ func (api *APITerm) InitExecution() {
 
 	// run command node tree execution
 	out, err := executeCommand(api, nil, tree)
-	api.OutputChan <- Output{
-		Type: Out,
-		Data: helpers.EscapeANSICodes(string(out))[stdoutoldlen:],
-	}
+
 	//if execution is errored and command not returned error
 	if err != nil && out == nil {
 		//return error throw chanel
@@ -111,8 +88,18 @@ func (api *APITerm) InitExecution() {
 			Type: Errored,
 			Data: err.Error(),
 		}
+		return
 	}
 
+	stringOut, _ := helpers.UTF16BytesToString(out)
+	output := helpers.EscapeANSICodes(stringOut)
+
+	if len(output) > 0 {
+		api.OutputChan <- Output{
+			Type: Out,
+			Data: output,
+		}
+	}
 	api.OutputChan <- Output{
 		Type: Exit,
 		Data: "",
@@ -235,73 +222,135 @@ func commandExecutor(api *APITerm, input, command string) ([]byte, error) {
 		return nil, nil
 	}
 
-	//check if we need to pass input from prev command output
-	if len(input) != 0 {
-		_, err := stdin.WriteString(input)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	var cmd *exec.Cmd
-	done := make(chan bool)
-
-	//create command from string -> [command, ...args]
-	commWithArgs := strings.Fields(command)
+	doneExec := make(chan bool)
+	var stdout bytes.Buffer
+	stdoutsended := 0
+	commandAwaiting := false
+	// commandExited = false
+	StdinReader, StdinWriter := io.Pipe()
 
 	//create Cmd struct according to OS
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("powershell", "-Command", strings.Join(commWithArgs, " "))
+		cmd = exec.Command("powershell", "-Command", command)
 	} else {
-		cmd = exec.Command(commWithArgs[0], commWithArgs[1:]...)
+		//create command from string -> [command, ...args]
+		args, err := splitCommand(command)
+		if err != nil {
+			return []byte{}, err
+		}
+		cmd = exec.Command(args[0], args[1:]...)
 	}
 
 	cmd.Dir = pwd
-	cmd.Stdin = bytes.NewReader([]byte(input))
-	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
+	cmd.Stdin = StdinReader
 
-	// Handle input piping
-	// if len(input) != 0 {
-	// } else {
-	// 	cmd.Stdin = os.Stdin
-	// }
+	go func() {
+		defer StdinWriter.Close()
+
+		//check if we need to pass input from prev command output
+		if len(input) > 0 {
+			_, err := StdinWriter.Write([]byte(input))
+			if err != nil {
+				log.Println("[ ERROR ] Unable to write to stdin:", err)
+			}
+		}
+
+		// count := 0
+		// outOnes := false
+
+		for {
+			select {
+			case <-doneExec:
+				commandAwaiting = false
+				return
+			default:
+				if commandAwaiting {
+					select {
+					case msg := <-sharedAPI.StdInputChan:
+						StdinWriter.Write([]byte(msg))
+					default:
+						outBytes := stdout.Bytes()
+						out := helpers.EscapeANSICodes(string(outBytes[stdoutsended:]))
+						stdoutsended = len(outBytes)
+						if len(out) > 0 {
+							// outOnes = true
+							api.OutputChan <- Output{
+								Type: Out,
+								Data: out,
+							}
+						} else {
+							// if !outOnes && count >= 25 {
+							// 	time.Sleep(100 * time.Millisecond)
+							// 	count += 1
+							// } else {
+							// 	return
+							// }
+						}
+					}
+				}
+			}
+		}
+	}()
 
 	//indicates if command expects input
 	go func() {
 		for {
-			time.Sleep(500 * time.Millisecond)
-			proc := cmd.Process
-			if proc != nil && !commandExited {
-				commandAwaiting = true
-				api.OutputChan <- Output{
-					Type: WaitingForInput,
-					Data: "",
+			select {
+			case <-doneExec:
+				return
+			case <-sharedAPI.CmdInterrupt:
+				log.Println("[ INFO ] [ CommExec ] Received interrupt signal")
+				commandAwaiting = false
+				close(doneExec)
+				cmd.Process.Kill()
+				return
+			default:
+				time.Sleep(500 * time.Millisecond)
+				proc := cmd.Process
+				if proc == nil && !commandAwaiting {
+					continue
 				}
-			}
 
-			if <-done {
-				break
+				state := cmd.ProcessState
+				if !commandAwaiting && state == nil {
+					commandAwaiting = true
+				} else {
+					if state != nil {
+						if state.Exited() {
+							commandAwaiting = false
+							close(doneExec)
+						}
+					}
+				}
+
 			}
 		}
 	}()
 
 	//run command with waiting for result
-	err := cmd.Run()
-	done <- true
+	err := cmd.Start()
 	if err != nil {
+		log.Println("[ ERROR ] Can not run command ", err)
 		return nil, err
 	}
 
-	return stdout.Bytes(), nil
+	err = cmd.Wait()
+	if err != nil {
+		log.Println("[ ERROR ] Error awaiting command ", err)
+		return nil, err
+	}
+
+	return stdout.Bytes()[stdoutsended:], nil
 }
 
 func middleware(command string) bool {
-	commandWithArgs := strings.Fields(command)
+	commandWithArgs, _ := splitCommand(command)
 
 	switch commandWithArgs[0] {
 	case "cd":
-		var dir string = pwd
+		var dir = pwd
 
 		if len(commandWithArgs) < 2 || commandWithArgs[1] == "~" {
 			// If no argument is provided or it's "~", go to the home directory
@@ -328,8 +377,77 @@ func middleware(command string) bool {
 		}
 		pwd = newDir
 
+		sharedAPI.OutputChan <- Output{
+			Type:    PWDChange,
+			Data:    newDir,
+			Payload: newDir,
+		}
+
 		return true
 	}
 
 	return false
+}
+
+func formPWDStruct() map[string]string {
+	filesAndDirs := make(map[string]string)
+
+	files, err := os.ReadDir(pwd)
+	if err != nil {
+		fmt.Println("Ошибка чтения каталога:", err)
+		return filesAndDirs
+	}
+
+	for _, file := range files {
+		fileType := "file"
+		if file.IsDir() {
+			fileType = "dir"
+		}
+		filesAndDirs[file.Name()] = fileType
+	}
+
+	return filesAndDirs
+}
+
+// splitCommand разбивает строку команды на аргументы
+func splitCommand(command string) ([]string, error) {
+	var args []string
+	var currentArg strings.Builder
+	inQuotes := false
+	escape := false
+
+	for _, r := range command {
+		switch {
+		case escape:
+			// Если символ был экранирован, добавляем его в текущий аргумент
+			currentArg.WriteRune(r)
+			escape = false
+		case r == '\\':
+			// Если встретили символ экранирования, включаем флаг escape
+			escape = true
+		case r == '"' || r == '\'':
+			// Обработка кавычек, если они начинаются или заканчиваются
+			inQuotes = !inQuotes
+		case unicode.IsSpace(r) && !inQuotes:
+			// Если это пробел и мы не в кавычках, то аргумент завершен
+			if currentArg.Len() > 0 {
+				args = append(args, currentArg.String())
+				currentArg.Reset()
+			}
+		default:
+			// Иначе добавляем символ к текущему аргументу
+			currentArg.WriteRune(r)
+		}
+	}
+
+	// Добавляем последний аргумент, если есть
+	if currentArg.Len() > 0 {
+		args = append(args, currentArg.String())
+	}
+
+	if inQuotes {
+		return nil, fmt.Errorf("mismatched quotes")
+	}
+
+	return args, nil
 }
